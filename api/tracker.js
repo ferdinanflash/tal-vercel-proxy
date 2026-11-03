@@ -159,7 +159,11 @@ async function zenrowsFetch(apiKey, targetUrl, opts = {}) {
   } else if (opts.premium) {
     u.searchParams.set('premium_proxy', 'true');
   }
-  if (opts.sessionId != null) u.searchParams.set('session_id', String(opts.sessionId));
+  // ZenRows: session_id must be a short integer; invalid values → REQS004
+  if (opts.sessionId != null) {
+    const sid = String(opts.sessionId).replace(/\D/g, '').slice(0, 5);
+    if (sid) u.searchParams.set('session_id', sid);
+  }
   if (opts.cookie) u.searchParams.set('custom_headers', 'true');
 
   const headers = { Accept: 'application/json, text/plain, */*' };
@@ -196,24 +200,35 @@ async function zenrowsFetch(apiKey, targetUrl, opts = {}) {
 
 /** Best-effort cookie refresh — TIDAK gagal jika cookie kosong */
 async function tryRefreshCookies(apiKey) {
-  const sessionId = String(Math.floor(Math.random() * 900000) + 100000);
+  // Short numeric session_id only (ZenRows REQS004 if invalid/too long)
+  const sessionId = String(Math.floor(Math.random() * 90000) + 10000);
   mem.sessionId = sessionId;
 
-  const first = await zenrowsFetch(apiKey, `${UPSTREAM}/servers?limit=5`, {
-    antibot: true,
-    sessionId,
-    cookie: cacheValid() ? mem.cookie : undefined,
-  });
+  try {
+    const first = await zenrowsFetch(apiKey, `${UPSTREAM}/servers?limit=5`, {
+      antibot: true,
+      sessionId,
+    });
 
-  let cookie = first.cookies || '';
-  if (cookie) {
-    mem.cookie = mergeCookies(mem.cookie, cookie);
-    mem.at = Date.now();
-    mem.source = 'zenrows-zr-cookies';
-    await saveCacheToSupabase(mem.cookie);
+    // ZenRows API error body (e.g. REQS004)
+    if (first.data && first.data.code) {
+      mem.lastDebug = Object.assign({}, mem.lastDebug || {}, { zenrowsApiError: first.data });
+      return { cookie: mem.cookie, data: null, ok: false, hadCookie: false };
+    }
+
+    let cookie = first.cookies || '';
+    if (cookie) {
+      mem.cookie = mergeCookies(mem.cookie, cookie);
+      mem.at = Date.now();
+      mem.source = 'zenrows-zr-cookies';
+      await saveCacheToSupabase(mem.cookie);
+    }
+
+    return { cookie: mem.cookie, data: first.data, ok: first.ok, hadCookie: !!cookie };
+  } catch (e) {
+    mem.lastDebug = Object.assign({}, mem.lastDebug || {}, { refreshError: e.message || String(e) });
+    return { cookie: mem.cookie, data: null, ok: false, hadCookie: false };
   }
-
-  return { cookie: mem.cookie, data: first.data, ok: first.ok, hadCookie: !!cookie };
 }
 
 async function ensureCookieSoft(apiKey, force) {
@@ -265,7 +280,7 @@ async function fetchTarget(apiKey, targetUrl) {
   }
 
   // 2) ZenRows + antibot (jalur yang sudah terbukti jalan)
-  const sessionId = mem.sessionId || String(Math.floor(Math.random() * 900000) + 100000);
+  const sessionId = mem.sessionId || String(Math.floor(Math.random() * 90000) + 10000);
   mem.sessionId = sessionId;
   const zr = await zenrowsFetch(apiKey, targetUrl, {
     antibot: true,
