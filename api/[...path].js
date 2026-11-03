@@ -1,66 +1,78 @@
-const UPSTREAM = "https://wosatlas.com/api/v1";
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
+
+const UPSTREAM = 'https://wosatlas.com/api/v1';
 
 export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
-  const allowOrigin = ALLOWED_ORIGINS.includes("*")
-    ? "*"
-    : ALLOWED_ORIGINS.includes(origin)
-    ? origin
-    : ALLOWED_ORIGINS[0];
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
 
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
 
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (!["GET", "HEAD"].includes(req.method)) {
-    return res.status(405).json({ error: "Method not allowed" });
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    return res.status(405).json({
+      error: 'Method not allowed'
+    });
   }
 
   try {
-    let parts = req.query.path;
-    if (!Array.isArray(parts)) parts = parts ? [parts] : [];
-    parts = parts.map(String);
-    if (
-      !parts.length ||
-      parts.some((p) => !p || p === "." || p === ".." || p.includes("/"))
-    ) {
-      return res.status(400).json({ error: "Invalid API path" });
+    const url = new URL(
+      req.url,
+      `https://${req.headers.host}`
+    );
+
+    // Remove /api/ from the requested path
+    const path = url.pathname
+      .replace(/^\/api\/?/, '')
+      .split('/')
+      .filter(Boolean);
+
+    if (!path.length) {
+      return res.status(400).json({
+        error: 'Invalid API path',
+        received: url.pathname
+      });
     }
 
     const target = new URL(
-      `${UPSTREAM}/${parts.map(encodeURIComponent).join("/")}`
+      `${UPSTREAM}/${path.map(encodeURIComponent).join('/')}`
     );
-    for (const [key, value] of Object.entries(req.query)) {
-      if (key === "path") continue;
-      if (Array.isArray(value))
-        value.forEach((v) => target.searchParams.append(key, String(v)));
-      else target.searchParams.set(key, String(value));
-    }
 
-    const upstream = await fetch(target.toString(), {
+    // Preserve query parameters
+    url.searchParams.forEach((value, key) => {
+      target.searchParams.append(key, value);
+    });
+
+    const response = await fetch(target.toString(), {
       method: req.method,
       headers: {
-        Accept: "application/json",
-        "User-Agent": "TAL-Vercel-API-Proxy/1.0",
-      },
-      redirect: "follow",
+        Accept: 'application/json',
+        'User-Agent': 'TAL-Vercel-API-Proxy/1.0'
+      }
     });
-    const body = await upstream.text();
+
+    const body = await response.text();
+
     res.setHeader(
-      "Content-Type",
-      upstream.headers.get("content-type") || "application/json; charset=utf-8"
+      'Content-Type',
+      response.headers.get('content-type') ||
+      'application/json; charset=utf-8'
     );
-    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
-    return res.status(upstream.status).send(body);
-  } catch (err) {
-    console.error("WoS Atlas proxy error:", err);
-    return res.status(502).json({ error: "Upstream API request failed" });
+
+    res.setHeader(
+      'Cache-Control',
+      's-maxage=300, stale-while-revalidate=600'
+    );
+
+    return res.status(response.status).send(body);
+
+  } catch (error) {
+    return res.status(502).json({
+      error: 'Upstream API request failed',
+      message: error.message
+    });
   }
 }
