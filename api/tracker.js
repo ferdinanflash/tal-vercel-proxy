@@ -1,25 +1,15 @@
 /**
- * Vercel Serverless — ZenRows proxy + cookie cache 12 jam
+ * Vercel Serverless — ZenRows proxy (cookie cache best-effort)
  *
- * Alur:
- *  1. Setiap 12 jam (atau cache kosong): request ZenRows (js_render+antibot)
- *     ke wosatlas.com, baca header Zr-Cookies, simpan.
- *  2. Request berikutnya: pakai cookie tersimpan.
- *     - Coba fetch LANGSUNG dari Vercel (0 kredit ZenRows).
- *     - Jika gagal → ZenRows ringan + Cookie header.
+ * Zr-Cookies sering TIDAK dikirim ZenRows (plan / target tidak Set-Cookie).
+ * Cookie cache = opsional. Data tetap diambil lewat ZenRows.
  *
  * Query:
- *   url=...     single URL
- *   all=1       walk list servers (pakai cookie)
- *   maxPages=N  default 25
- *   refresh=1   paksa refresh cookie
- *   status=1    info cache saja (tanpa scrape)
+ *   url=... | all=1 | maxPages=N | refresh=1 | status=1 | debug=1
  *
- * Env:
- *   ZENROWS_API_KEY          (wajib)
- *   SUPABASE_URL             (opsional, persist cookie lintas cold start)
- *   SUPABASE_SERVICE_ROLE_KEY (opsional)
- *   COOKIE_TTL_HOURS         (default 12)
+ * Env: ZENROWS_API_KEY (wajib)
+ *      SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (opsional persist cookie)
+ *      COOKIE_TTL_HOURS (default 12)
  */
 
 const UPSTREAM = 'https://wosatlas.com/api/v1';
@@ -27,8 +17,13 @@ const SITE = 'https://wosatlas.com';
 const ALLOWED_HOSTS = new Set(['wosatlas.com', 'www.wosatlas.com', 'api.wosatlas.com']);
 const CACHE_KEY = 'wosatlas_zr_cookies';
 
-// In-memory (bertahan selama instance Vercel masih warm)
-const mem = { cookie: null, at: 0, source: 0 };
+const mem = {
+  cookie: null,
+  at: 0,
+  source: null,
+  sessionId: null,
+  lastDebug: null,
+};
 
 function ttlMs() {
   const h = parseFloat(process.env.COOKIE_TTL_HOURS || '12');
@@ -41,39 +36,33 @@ function setCors(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-function cacheAgeMs() {
-  return mem.at ? Date.now() - mem.at : null;
-}
-
 function cacheValid() {
   return !!(mem.cookie && mem.at && Date.now() - mem.at < ttlMs());
 }
 
-// ---- Optional Supabase persistence ----
+function cacheAgeMs() {
+  return mem.at ? Date.now() - mem.at : null;
+}
+
 async function loadCacheFromSupabase() {
   const base = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   if (!base || !key) return null;
   try {
-    const url =
-      `${base}/rest/v1/wos_proxy_cache?key=eq.${encodeURIComponent(CACHE_KEY)}&select=value,updated_at&limit=1`;
+    const url = `${base}/rest/v1/wos_proxy_cache?key=eq.${encodeURIComponent(CACHE_KEY)}&select=value,updated_at&limit=1`;
     const res = await fetch(url, {
-      headers: {
-        apikey: key,
-        Authorization: `Bearer ${key}`,
-        Accept: 'application/json',
-      },
+      headers: { apikey: key, Authorization: `Bearer ${key}`, Accept: 'application/json' },
     });
     if (!res.ok) return null;
     const rows = await res.json();
     if (!Array.isArray(rows) || !rows[0]) return null;
     const updated = new Date(rows[0].updated_at).getTime();
     if (!Number.isFinite(updated) || Date.now() - updated >= ttlMs()) return null;
-    const value = rows[0].value;
-    if (!value || typeof value !== 'string') return null;
-    mem.cookie = value;
+    if (!rows[0].value) return null;
+    mem.cookie = rows[0].value;
     mem.at = updated;
-    return value;
+    mem.source = 'supabase';
+    return mem.cookie;
   } catch {
     return null;
   }
@@ -82,7 +71,7 @@ async function loadCacheFromSupabase() {
 async function saveCacheToSupabase(cookie) {
   const base = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-  if (!base || !key) return;
+  if (!base || !key || !cookie) return;
   try {
     await fetch(`${base}/rest/v1/wos_proxy_cache`, {
       method: 'POST',
@@ -103,14 +92,63 @@ async function saveCacheToSupabase(cookie) {
   }
 }
 
-async function ensureMemoryCache() {
-  if (cacheValid()) return mem.cookie;
-  const fromDb = await loadCacheFromSupabase();
-  return fromDb;
+function collectZrHeaders(response) {
+  const out = {};
+  try {
+    for (const [k, v] of response.headers.entries()) {
+      if (k.toLowerCase().startsWith('zr-') || k.toLowerCase().startsWith('x-request')) {
+        out[k] = v;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  // undici may expose set-cookie separately
+  try {
+    if (typeof response.headers.getSetCookie === 'function') {
+      const sc = response.headers.getSetCookie();
+      if (sc && sc.length) out['set-cookie'] = sc;
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
 }
 
-// ---- ZenRows helpers ----
-function buildZenrowsUrl(apiKey, targetUrl, opts = {}) {
+function pickCookiesFromHeaders(hdrs) {
+  const keys = Object.keys(hdrs || {});
+  for (const k of keys) {
+    if (k.toLowerCase() === 'zr-cookies') return String(hdrs[k] || '').trim();
+  }
+  // fallback: join Set-Cookie name=value
+  const sc = hdrs['set-cookie'];
+  if (Array.isArray(sc) && sc.length) {
+    return sc
+      .map((line) => String(line).split(';')[0].trim())
+      .filter(Boolean)
+      .join('; ');
+  }
+  return '';
+}
+
+function mergeCookies(a, b) {
+  const map = new Map();
+  for (const part of `${a || ''};${b || ''}`.split(';')) {
+    const s = part.trim();
+    if (!s) continue;
+    const eq = s.indexOf('=');
+    if (eq <= 0) continue;
+    const k = s.slice(0, eq).trim();
+    const v = s.slice(eq + 1).trim();
+    if (['path', 'domain', 'expires', 'max-age', 'secure', 'httponly', 'samesite'].includes(k.toLowerCase())) {
+      continue;
+    }
+    map.set(k, v);
+  }
+  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function zenrowsFetch(apiKey, targetUrl, opts = {}) {
   const u = new URL('https://api.zenrows.com/v1/');
   u.searchParams.set('apikey', apiKey);
   u.searchParams.set('url', targetUrl);
@@ -121,139 +159,71 @@ function buildZenrowsUrl(apiKey, targetUrl, opts = {}) {
   } else if (opts.premium) {
     u.searchParams.set('premium_proxy', 'true');
   }
-  if (opts.sessionId) u.searchParams.set('session_id', String(opts.sessionId));
-  if (opts.customHeaders) u.searchParams.set('custom_headers', 'true');
-  return u;
-}
+  if (opts.sessionId != null) u.searchParams.set('session_id', String(opts.sessionId));
+  if (opts.cookie) u.searchParams.set('custom_headers', 'true');
 
-async function zenrowsRequest(apiKey, targetUrl, opts = {}) {
-  const url = buildZenrowsUrl(apiKey, targetUrl, opts);
-  const headers = { Accept: 'application/json' };
-  if (opts.cookie) {
-    headers.Cookie = opts.cookie;
-  }
-  const response = await fetch(url.toString(), { headers });
-  const zrCookies =
-    response.headers.get('Zr-Cookies') ||
-    response.headers.get('zr-cookies') ||
-    '';
+  const headers = { Accept: 'application/json, text/plain, */*' };
+  if (opts.cookie) headers.Cookie = opts.cookie;
+
+  const response = await fetch(u.toString(), { headers });
+  const zrHeaders = collectZrHeaders(response);
+  const cookies = pickCookiesFromHeaders(zrHeaders);
   const text = await response.text();
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    data = { _raw: true, body: text.slice(0, 50000) };
+    data = { _raw: true, body: text.slice(0, 8000) };
   }
+
+  mem.lastDebug = {
+    status: response.status,
+    ok: response.ok,
+    zrHeaderKeys: Object.keys(zrHeaders),
+    zrHeaders,
+    cookieLen: cookies ? cookies.length : 0,
+    bodyPreview: typeof text === 'string' ? text.slice(0, 120) : null,
+  };
+
   return {
     ok: response.ok,
     status: response.status,
     data,
-    zrCookies: zrCookies.trim(),
+    cookies,
+    zrHeaders,
   };
 }
 
-/** Request pertama / refresh: antibot, capture cookie */
-async function refreshCookies(apiKey) {
-  // Hit homepage + API list agar CF/app cookies ter-set
+/** Best-effort cookie refresh — TIDAK gagal jika cookie kosong */
+async function tryRefreshCookies(apiKey) {
   const sessionId = String(Math.floor(Math.random() * 900000) + 100000);
-  const first = await zenrowsRequest(apiKey, `${SITE}/`, {
+  mem.sessionId = sessionId;
+
+  const first = await zenrowsFetch(apiKey, `${UPSTREAM}/servers?limit=5`, {
     antibot: true,
     sessionId,
+    cookie: cacheValid() ? mem.cookie : undefined,
   });
-  let cookie = first.zrCookies || '';
 
-  const second = await zenrowsRequest(
-    apiKey,
-    `${UPSTREAM}/servers?limit=5`,
-    {
-      antibot: true,
-      sessionId,
-      cookie: cookie || undefined,
-      customHeaders: !!cookie,
-    }
-  );
-  if (second.zrCookies) {
-    cookie = mergeCookies(cookie, second.zrCookies);
-  }
-
-  if (!cookie) {
-    throw new Error(
-      'ZenRows tidak mengembalikan Zr-Cookies. Coba naikkan plan / cek antibot.'
-    );
-  }
-
-  mem.cookie = cookie;
-  mem.at = Date.now();
-  mem.source = 'zenrows-refresh';
-  await saveCacheToSupabase(cookie);
-  return cookie;
-}
-
-function mergeCookies(a, b) {
-  const map = new Map();
-  for (const part of `${a};${b}`.split(';')) {
-    const s = part.trim();
-    if (!s) continue;
-    const eq = s.indexOf('=');
-    if (eq <= 0) continue;
-    const k = s.slice(0, eq).trim();
-    const v = s.slice(eq + 1).trim();
-    // skip attributes
-    if (['path', 'domain', 'expires', 'max-age', 'secure', 'httponly', 'samesite'].includes(k.toLowerCase())) {
-      continue;
-    }
-    map.set(k, v);
-  }
-  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-async function getCookie(apiKey, forceRefresh) {
-  if (!forceRefresh) {
-    const existing = await ensureMemoryCache();
-    if (existing && cacheValid()) return existing;
-  }
-  return refreshCookies(apiKey);
-}
-
-/** Fetch target: direct dulu (gratis), fallback ZenRows + cookie */
-async function fetchWithCookie(apiKey, targetUrl, cookie) {
-  // 1) Direct dari Vercel
-  try {
-    const res = await fetch(targetUrl, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'TAL-Vercel-Proxy/cookie-cache',
-        ...(cookie ? { Cookie: cookie } : {}),
-      },
-    });
-    if (res.ok) {
-      const text = await res.text();
-      try {
-        return { data: JSON.parse(text), via: 'direct' };
-      } catch {
-        /* fall through */
-      }
-    }
-  } catch {
-    /* fall through */
-  }
-
-  // 2) ZenRows ringan + cookie (tanpa antibot penuh)
-  const zr = await zenrowsRequest(apiKey, targetUrl, {
-    premium: true,
-    cookie,
-    customHeaders: true,
-    sessionId: 347512,
-  });
-  if (zr.zrCookies) {
-    mem.cookie = mergeCookies(cookie, zr.zrCookies);
+  let cookie = first.cookies || '';
+  if (cookie) {
+    mem.cookie = mergeCookies(mem.cookie, cookie);
     mem.at = Date.now();
+    mem.source = 'zenrows-zr-cookies';
     await saveCacheToSupabase(mem.cookie);
   }
-  if (!zr.ok && zr.data && zr.data._raw) {
-    throw new Error(`ZenRows HTTP ${zr.status}`);
+
+  return { cookie: mem.cookie, data: first.data, ok: first.ok, hadCookie: !!cookie };
+}
+
+async function ensureCookieSoft(apiKey, force) {
+  if (!force) {
+    if (cacheValid()) return mem.cookie;
+    await loadCacheFromSupabase();
+    if (cacheValid()) return mem.cookie;
   }
-  return { data: zr.data, via: 'zenrows-cookie' };
+  const r = await tryRefreshCookies(apiKey);
+  return r.cookie;
 }
 
 function extractItems(data) {
@@ -272,11 +242,57 @@ function extractNext(data) {
   return String(n);
 }
 
+async function fetchTarget(apiKey, targetUrl) {
+  // 1) Direct (gratis)
+  try {
+    const res = await fetch(targetUrl, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'TAL-Vercel-Proxy/1.1',
+        ...(mem.cookie ? { Cookie: mem.cookie } : {}),
+      },
+    });
+    if (res.ok) {
+      const text = await res.text();
+      try {
+        return { data: JSON.parse(text), via: 'direct' };
+      } catch {
+        /* fall through */
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 2) ZenRows + antibot (jalur yang sudah terbukti jalan)
+  const sessionId = mem.sessionId || String(Math.floor(Math.random() * 900000) + 100000);
+  mem.sessionId = sessionId;
+  const zr = await zenrowsFetch(apiKey, targetUrl, {
+    antibot: true,
+    sessionId,
+    cookie: mem.cookie || undefined,
+  });
+  if (zr.cookies) {
+    mem.cookie = mergeCookies(mem.cookie, zr.cookies);
+    mem.at = Date.now();
+    mem.source = 'zenrows-zr-cookies';
+    await saveCacheToSupabase(mem.cookie);
+  }
+  if (!zr.ok && zr.data && zr.data._raw) {
+    throw new Error(`ZenRows HTTP ${zr.status}: ${String(zr.data.body || '').slice(0, 200)}`);
+  }
+  if (zr.data && zr.data.detail && !extractItems(zr.data).length) {
+    // ZenRows API error object
+    throw new Error(typeof zr.data.detail === 'string' ? zr.data.detail : JSON.stringify(zr.data).slice(0, 200));
+  }
+  return { data: zr.data, via: 'zenrows-antibot' };
+}
+
 export default async function handler(req, res) {
   setCors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed. Use GET.' });
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   const apiKey = process.env.ZENROWS_API_KEY;
@@ -286,29 +302,32 @@ export default async function handler(req, res) {
     });
   }
 
-  // Status cache
   if (String(req.query.status || '') === '1') {
-    await ensureMemoryCache();
+    await loadCacheFromSupabase();
     return res.status(200).json({
       hasCookie: !!mem.cookie,
       valid: cacheValid(),
       ageMs: cacheAgeMs(),
       ttlMs: ttlMs(),
-      source: mem.source || null,
-      cookiePreview: mem.cookie ? mem.cookie.slice(0, 40) + '…' : null,
+      source: mem.source,
+      cookiePreview: mem.cookie ? mem.cookie.slice(0, 48) + '…' : null,
       supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+      note: 'Zr-Cookies sering kosong; data tetap bisa diambil tanpa cookie cache.',
+      lastDebug: mem.lastDebug,
     });
   }
 
   const forceRefresh = String(req.query.refresh || '') === '1';
   const wantAll = String(req.query.all || '') === '1';
+  const wantDebug = String(req.query.debug || '') === '1';
   const maxPages = Math.min(
     Math.max(parseInt(String(req.query.maxPages || '25'), 10) || 25, 1),
     40
   );
 
   try {
-    const cookie = await getCookie(apiKey, forceRefresh);
+    // Soft cookie attempt — never blocks data path
+    await ensureCookieSoft(apiKey, forceRefresh);
 
     if (!wantAll) {
       const targetUrl =
@@ -318,28 +337,29 @@ export default async function handler(req, res) {
       try {
         parsed = new URL(targetUrl);
       } catch {
-        return res.status(400).json({ error: 'Parameter url tidak valid.' });
+        return res.status(400).json({ error: 'url tidak valid' });
       }
       if (!ALLOWED_HOSTS.has(parsed.hostname)) {
-        return res.status(400).json({
-          error: 'Host tidak diizinkan. Hanya wosatlas.com / api.wosatlas.com.',
-        });
+        return res.status(400).json({ error: 'Host tidak diizinkan' });
       }
-      const { data, via } = await fetchWithCookie(apiKey, targetUrl, cookie);
-      return res.status(200).json(
+
+      const { data, via } = await fetchTarget(apiKey, targetUrl);
+      const payload =
         data && typeof data === 'object'
           ? Object.assign({}, data, {
               _proxy: {
                 via,
-                cookieAgeMs: cacheAgeMs(),
+                hasCookie: !!mem.cookie,
                 cookieValid: cacheValid(),
+                cookieAgeMs: cacheAgeMs(),
+                ...(wantDebug ? { lastDebug: mem.lastDebug } : {}),
               },
             })
-          : data
-      );
+          : data;
+      return res.status(200).json(payload);
     }
 
-    // all=1 — walk cursors with cached cookie
+    // all=1
     let next = null;
     const allItems = [];
     const pages = [];
@@ -350,22 +370,21 @@ export default async function handler(req, res) {
       page += 1;
       let targetUrl;
       if (next) {
-        if (String(next).startsWith('http')) {
-          targetUrl = next;
-        } else {
-          targetUrl = `${UPSTREAM}/servers?limit=200&cursor=${encodeURIComponent(next)}`;
-        }
+        targetUrl = String(next).startsWith('http')
+          ? next
+          : `${UPSTREAM}/servers?limit=200&cursor=${encodeURIComponent(next)}`;
       } else {
         targetUrl = `${UPSTREAM}/servers?limit=200`;
       }
 
-      const { data, via } = await fetchWithCookie(apiKey, targetUrl, cookie);
+      const { data, via } = await fetchTarget(apiKey, targetUrl);
       viaLast = via;
       if (data && data._raw) {
         return res.status(502).json({
           error: 'Non-JSON dari upstream',
           page,
           sample: String(data.body || '').slice(0, 200),
+          lastDebug: mem.lastDebug,
         });
       }
       const items = extractItems(data);
@@ -381,20 +400,22 @@ export default async function handler(req, res) {
       total: allItems.length,
       partial: !!next,
       meta: {
-        source: 'cookie-cache',
+        source: 'zenrows',
         via: viaLast,
         pages: pages.length,
         pageDetails: pages,
         stoppedBecause: next ? 'maxPages' : 'done',
         maxPages,
-        cookieAgeMs: cacheAgeMs(),
+        hasCookie: !!mem.cookie,
         cookieValid: cacheValid(),
+        ...(wantDebug ? { lastDebug: mem.lastDebug } : {}),
       },
     });
   } catch (error) {
     return res.status(500).json({
-      error: 'Gagal proxy / cookie cache',
+      error: 'Gagal proxy',
       details: error.message || String(error),
+      lastDebug: mem.lastDebug,
     });
   }
 }
